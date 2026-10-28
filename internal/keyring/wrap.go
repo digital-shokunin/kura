@@ -172,13 +172,32 @@ func UnwrapGPG(ct []byte, tryKeys ...string) (crypt.Key, error) {
 	for _, k := range tryKeys {
 		args = append(args, "--try-secret-key", strings.TrimSuffix(k, "!"))
 	}
-	var out bytes.Buffer
+	out := &cappedBuffer{max: crypt.KeySize}
 	cmd := exec.Command(gpg, append(args, "--decrypt")...)
 	cmd.Stdin = bytes.NewReader(ct)
-	cmd.Stdout = &out
+	cmd.Stdout = out
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return crypt.Key{}, fmt.Errorf("gpg decrypt: %w", err)
 	}
 	return crypt.KeyFromBytes(out.Bytes())
 }
+
+// cappedBuffer fails writes past max bytes. keys/gpg.asc comes from the
+// untrusted store and anyone can encrypt to a public key, so a compressed
+// message could otherwise expand without bound; the failed write closes
+// gpg's stdout and stops it. The buffer is a field, not embedded, so that
+// io.Copy cannot bypass Write through bytes.Buffer's ReadFrom.
+type cappedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len()+len(p) > b.max {
+		return 0, fmt.Errorf("gpg output exceeds %d bytes; %s is not a kura key", b.max, GPGKeyPath)
+	}
+	return b.buf.Write(p)
+}
+
+func (b *cappedBuffer) Bytes() []byte { return b.buf.Bytes() }

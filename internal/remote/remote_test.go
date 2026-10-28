@@ -296,6 +296,11 @@ func TestGCDeletesOnlyOldUnreferencedPacks(t *testing.T) {
 	for _, p := range []Pack{p1, p2, p3, orphanOld} {
 		age(p, 96*time.Hour)
 	}
+	// The store saw those manifests at the same times their writers claim.
+	for seq, d := range map[uint64]time.Duration{1: 72 * time.Hour, 2: 48 * time.Hour, 3: time.Hour} {
+		old := time.Now().Add(-d)
+		os.Chtimes(filepath.Join(f.dir, "remote", manifestKey(seq)), old, old)
+	}
 
 	res, err := a.GC(ctx, 24*time.Hour, false)
 	if err != nil {
@@ -396,5 +401,53 @@ func TestGCKeepsPackWithRecentPart(t *testing.T) {
 	}
 	if err := a.VerifyPackStored(ctx, p); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A writer whose clock runs days slow must not shorten gc's manifest walk:
+// packs that a manifest the store received minutes ago references survive.
+func TestGCIgnoresSlowWriterClock(t *testing.T) {
+	f := newFixture(t)
+	a := f.client(t, "a")
+	ctx := context.Background()
+	realNow := now
+	defer func() { now = realNow }()
+
+	var packs []Pack
+	for range 3 {
+		p, err := a.UploadPack(ctx, bytes.NewReader([]byte("pack")), 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packs = append(packs, p)
+	}
+	commit := func(ps ...Pack) {
+		cur, err := a.Latest(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := cur.Clone()
+		next.Packs = ps
+		if _, err := a.Commit(ctx, cur, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit(packs[0])
+	now = func() time.Time { return realNow().Add(-72 * time.Hour) } // slow clock
+	commit(packs[1])
+	commit(packs[2])
+	now = realNow
+	for _, p := range packs {
+		old := time.Now().Add(-96 * time.Hour)
+		for i := range p.Parts {
+			os.Chtimes(filepath.Join(f.dir, "remote", partKey(p.ID, i)), old, old)
+		}
+	}
+	res, err := a.GC(ctx, 24*time.Hour, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Deleted) != 0 {
+		t.Fatalf("gc deleted %v, which manifests written minutes ago reference", res.Deleted)
 	}
 }

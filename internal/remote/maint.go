@@ -204,9 +204,20 @@ func (r *Remote) GC(ctx context.Context, grace time.Duration, dryRun bool) (*GCR
 			referenced[p.ID] = true
 		}
 		// Keep the newest manifest older than the cutoff too: it was current
-		// at the cutoff, so readers may still be using it.
-		if s.Time.Before(cutoff) || s.Seq == 0 {
+		// at the cutoff, so readers may still be using it. Its time comes from
+		// the writer's clock, so the store's timestamp must agree that it is
+		// old: a writer with a slow clock cannot shorten the walk.
+		if s.Seq == 0 {
 			break
+		}
+		if s.Time.Before(cutoff) {
+			info, err := r.Store.Head(ctx, manifestKey(s.Seq))
+			if err != nil {
+				return nil, err
+			}
+			if info.ModTime.Before(cutoff) {
+				break
+			}
 		}
 		if s, err = r.readManifest(ctx, s.Seq-1); err != nil {
 			return nil, fmt.Errorf("walking manifests: %w", err)

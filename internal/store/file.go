@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,8 +27,12 @@ func init() {
 // File stores objects as files under a directory. PutIfAbsent uses link(2),
 // which fails atomically if the target exists, so it is safe across processes
 // and on most network filesystems that support hard links.
+//
+// Every operation goes through an os.Root, so a symlink planted in the
+// directory by whoever else can write to it (a shared NAS, say) cannot point
+// kura's reads, writes or gc deletes at files outside it.
 type File struct {
-	root string
+	root *os.Root
 }
 
 // NewFile returns a File store rooted at dir, creating it if needed.
@@ -41,7 +47,11 @@ func NewFile(dir string) (*File, error) {
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, err
 	}
-	return &File{root: abs}, nil
+	root, err := os.OpenRoot(abs)
+	if err != nil {
+		return nil, err
+	}
+	return &File{root: root}, nil
 }
 
 func (f *File) path(key string) (string, error) {
@@ -53,7 +63,7 @@ func (f *File) path(key string) (string, error) {
 			return "", fmt.Errorf("store: invalid key %q", key)
 		}
 	}
-	return filepath.Join(f.root, filepath.FromSlash(key)), nil
+	return filepath.FromSlash(key), nil
 }
 
 func (f *File) Get(_ context.Context, key string) (io.ReadCloser, error) {
@@ -61,7 +71,7 @@ func (f *File) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	fh, err := os.Open(p)
+	fh, err := f.root.Open(p)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -71,10 +81,11 @@ func (f *File) Get(_ context.Context, key string) (io.ReadCloser, error) {
 // writeTemp writes r to a temp file next to final and fsyncs it.
 func (f *File) writeTemp(final string, r io.Reader, size int64) (string, error) {
 	dir := filepath.Dir(final)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := f.root.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	name := filepath.Join(dir, ".tmp-"+rand.Text())
+	tmp, err := f.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
@@ -89,10 +100,10 @@ func (f *File) writeTemp(final string, r io.Reader, size int64) (string, error) 
 		err = cerr
 	}
 	if err != nil {
-		os.Remove(tmp.Name())
+		f.root.Remove(name)
 		return "", err
 	}
-	return tmp.Name(), nil
+	return name, nil
 }
 
 func (f *File) Put(_ context.Context, key string, r io.Reader, size int64) error {
@@ -104,8 +115,8 @@ func (f *File) Put(_ context.Context, key string, r io.Reader, size int64) error
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		os.Remove(tmp)
+	if err := f.root.Rename(tmp, p); err != nil {
+		f.root.Remove(tmp)
 		return err
 	}
 	return nil
@@ -120,8 +131,8 @@ func (f *File) PutIfAbsent(_ context.Context, key string, r io.Reader, size int6
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp)
-	if err := os.Link(tmp, p); err != nil {
+	defer f.root.Remove(tmp)
+	if err := f.root.Link(tmp, p); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return ErrExists
 		}
@@ -135,7 +146,7 @@ func (f *File) Head(_ context.Context, key string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	st, err := os.Stat(p)
+	st, err := f.root.Stat(p)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Info{}, ErrNotFound
 	}
@@ -145,21 +156,18 @@ func (f *File) Head(_ context.Context, key string) (Info, error) {
 	return Info{Size: st.Size(), ModTime: st.ModTime()}, nil
 }
 
+// List returns regular files only. WalkDir does not descend into symlinked
+// directories, and symlinks themselves are skipped.
 func (f *File) List(_ context.Context, prefix string) ([]string, error) {
 	var keys []string
-	err := filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(f.root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || strings.HasPrefix(d.Name(), ".tmp-") {
+		if !d.Type().IsRegular() || strings.HasPrefix(d.Name(), ".tmp-") {
 			return nil
 		}
-		rel, err := filepath.Rel(f.root, p)
-		if err != nil {
-			return err
-		}
-		key := filepath.ToSlash(rel)
-		if strings.HasPrefix(key, prefix) {
+		if key := path.Clean(p); strings.HasPrefix(key, prefix) {
 			keys = append(keys, key)
 		}
 		return nil
@@ -173,7 +181,7 @@ func (f *File) Delete(_ context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := f.root.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
