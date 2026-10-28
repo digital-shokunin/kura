@@ -98,7 +98,7 @@ func (r *Remote) Compact(ctx context.Context) (*CompactResult, error) {
 		next.Packs = []Pack{res.Pack}
 		next.Base = maps.Clone(cur.Refs)
 		_, err = r.Commit(ctx, cur, next)
-		if errors.Is(err, ErrConflict) && attempt < 5 {
+		if (errors.Is(err, ErrConflict) || errors.Is(err, ErrStale)) && attempt < 5 {
 			r.DeletePack(ctx, res.Pack) // definitely unreferenced
 			continue
 		}
@@ -165,7 +165,7 @@ func (r *Remote) MergeIncremental(ctx context.Context, g *gitcmd.Git, cur *Snaps
 	next := cur.Clone()
 	next.Packs = []Pack{cur.Packs[0], merged}
 	s, err := r.Commit(ctx, cur, next)
-	if errors.Is(err, ErrConflict) {
+	if errors.Is(err, ErrConflict) || errors.Is(err, ErrStale) {
 		r.DeletePack(ctx, merged)
 		return nil, nil
 	}
@@ -184,9 +184,11 @@ type GCResult struct {
 }
 
 // GC deletes stored packs that no manifest written within grace references
-// and that are themselves older than grace. Uploads in progress are younger
-// than UploadDeadline (< grace), and readers holding a manifest from within
-// the grace window still find every pack it names.
+// and whose newest part is older than grace. An upload in progress keeps
+// adding parts, and Commit refuses a pack whose last part is older than
+// UploadDeadline (< grace), so gc never deletes a pack a commit can still
+// reference. Readers holding a manifest from within the grace window still
+// find every pack it names.
 func (r *Remote) GC(ctx context.Context, grace time.Duration, dryRun bool) (*GCResult, error) {
 	if grace < 2*UploadDeadline {
 		return nil, fmt.Errorf("grace period must be at least %s", 2*UploadDeadline)
@@ -231,11 +233,17 @@ func (r *Remote) GC(ctx context.Context, grace time.Duration, dryRun bool) (*GCR
 		if referenced[id] {
 			continue
 		}
-		info, err := r.Store.Head(ctx, byPack[id][0])
-		if err != nil {
-			return nil, err
+		var newest time.Time
+		for _, k := range byPack[id] {
+			info, err := r.Store.Head(ctx, k)
+			if err != nil {
+				return nil, err
+			}
+			if info.ModTime.After(newest) {
+				newest = info.ModTime
+			}
 		}
-		if info.ModTime.After(cutoff) {
+		if newest.After(cutoff) {
 			res.Kept = append(res.Kept, id)
 			continue
 		}

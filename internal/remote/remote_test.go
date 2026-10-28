@@ -318,3 +318,83 @@ func TestGCDeletesOnlyOldUnreferencedPacks(t *testing.T) {
 		t.Fatal("GC accepted a grace period shorter than twice the upload deadline")
 	}
 }
+
+func TestCommitRefusesStaleOrMissingPack(t *testing.T) {
+	f := newFixture(t)
+	a := f.client(t, "a")
+	ctx := context.Background()
+	commit := func(p Pack) error {
+		cur, err := a.Latest(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := cur.Clone()
+		next.Packs = append(next.Packs, p)
+		_, err = a.Commit(ctx, cur, next)
+		return err
+	}
+	upload := func() Pack {
+		p, err := a.UploadPack(ctx, bytes.NewReader([]byte("pack")), 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// The machine slept between upload and commit: gc may have run.
+	slept := upload()
+	slept.stored = time.Now().Add(-UploadDeadline - time.Minute)
+	if err := commit(slept); !errors.Is(err, ErrStale) {
+		t.Fatalf("commit of a pack stored before the deadline: %v, want ErrStale", err)
+	}
+	// A pack taken from an old manifest has no upload time.
+	fromManifest := upload()
+	fromManifest.stored = time.Time{}
+	if err := commit(fromManifest); !errors.Is(err, ErrStale) {
+		t.Fatalf("commit of a pack with no upload time: %v, want ErrStale", err)
+	}
+	// A part went missing after upload (a concurrent gc, or a broken store).
+	missing := upload()
+	if err := f.store.Delete(ctx, partKey(missing.ID, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := commit(missing); err == nil {
+		t.Fatal("commit referenced a pack with a missing part")
+	}
+	if err := commit(upload()); err != nil {
+		t.Fatalf("fresh pack: %v", err)
+	}
+	// Packs already in the previous manifest are not re-checked.
+	push(t, a, "refs/heads/main", "0123456789012345678901234567890123456789")
+}
+
+func TestGCKeepsPackWithRecentPart(t *testing.T) {
+	f := newFixture(t)
+	a := f.client(t, "a")
+	ctx := context.Background()
+	defer func(old int64) { PartSize = old }(PartSize)
+	PartSize = 64
+
+	// A slow upload: the first part is past the grace period, the last is not.
+	p, err := a.UploadPack(ctx, bytes.NewReader(make([]byte, 4096)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Parts) < 2 {
+		t.Fatalf("got %d parts, want several", len(p.Parts))
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for i := range p.Parts[:len(p.Parts)-1] {
+		os.Chtimes(filepath.Join(f.dir, "remote", partKey(p.ID, i)), old, old)
+	}
+	res, err := a.GC(ctx, 24*time.Hour, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Deleted) != 0 || len(res.Kept) != 1 {
+		t.Fatalf("deleted %v, kept %v; want the in-progress pack kept", res.Deleted, res.Kept)
+	}
+	if err := a.VerifyPackStored(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+}

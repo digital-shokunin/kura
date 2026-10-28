@@ -184,6 +184,11 @@ func defaultIdentityFile() string {
 	return filepath.Join(dir, "identities")
 }
 
+// keyFilesHint covers key files that fell out of step with the manifest, for
+// example after a `recipients` change was interrupted.
+const keyFilesHint = "\nkura: if this key should be a recipient, run `kura recipients <url> sync` " +
+	"on a machine that has the repo key unlocked"
+
 func cmdUnlock(args []string) error {
 	fs := newFlags("unlock")
 	var idFiles multiFlag
@@ -245,7 +250,7 @@ func cmdUnlock(args []string) error {
 			return fmt.Errorf("reading %s: %w", keyring.AgeKeyPath, err)
 		}
 		if k, err = keyring.UnwrapAge(ct, ids); err != nil {
-			return err
+			return fmt.Errorf("%w%s", err, keyFilesHint)
 		}
 	} else {
 		ct, err := readObject(ctx, s, keyring.GPGKeyPath)
@@ -254,7 +259,7 @@ func cmdUnlock(args []string) error {
 		}
 		fmt.Fprintln(os.Stderr, "kura: decrypting with gpg (your Yubikey may ask for its PIN and a touch)")
 		if k, err = keyring.UnwrapGPG(ct, gpgKeys...); err != nil {
-			return err
+			return fmt.Errorf("%w%s", err, keyFilesHint)
 		}
 	}
 	got := k.Fingerprint(cfg.RepoID)
@@ -343,8 +348,8 @@ func cmdRecipients(args []string) error {
 		return err
 	}
 	action := pos[1]
-	if action != "list" && action != "add" && action != "remove" {
-		return fmt.Errorf("unknown recipients action %q (list, add, remove)", action)
+	if action != "list" && action != "add" && action != "remove" && action != "sync" {
+		return fmt.Errorf("unknown recipients action %q (list, add, remove, sync)", action)
 	}
 	ctx := context.Background()
 	r, done, err := openRemoteWithState(ctx, pos[0])
@@ -363,6 +368,13 @@ func cmdRecipients(args []string) error {
 		case "list":
 			printRecipients(*rc)
 			return nil
+		case "sync":
+			if err := writeKeys(ctx, r, *rc); err != nil {
+				return err
+			}
+			fmt.Println("Key files rewritten; key is wrapped to:")
+			printRecipients(*rc)
+			return nil
 		case "add":
 			for _, a := range ages {
 				if !slices.Contains(rc.Age, a) {
@@ -378,11 +390,9 @@ func cmdRecipients(args []string) error {
 			rc.Age = slices.DeleteFunc(rc.Age, func(a string) bool { return slices.Contains(ages, a) })
 			rc.GPG = slices.DeleteFunc(rc.GPG, func(g string) bool { return slices.Contains(gpgs, g) })
 		}
-		objs, err := wrapKeys(r.Key, *rc)
-		if err != nil {
-			return err
-		}
-		if err := storeKeys(ctx, r.Store, objs); err != nil {
+		// The key files go first so the new list can unlock as soon as a
+		// manifest records it; the next attempt rewrites them from fresh state.
+		if err := writeKeys(ctx, r, *rc); err != nil {
 			return err
 		}
 		_, err = r.Commit(ctx, cur, next)
@@ -390,6 +400,12 @@ func cmdRecipients(args []string) error {
 			continue
 		}
 		if err != nil {
+			// The key files now match no manifest, and a concurrent writer's
+			// recipients may be missing from them. Restore the recorded list.
+			if serr := syncKeys(ctx, r); serr != nil {
+				fmt.Fprintf(os.Stderr, "kura: warning: key files may not match the manifest (%v); "+
+					"run `kura recipients '%s' sync`\n", serr, pos[0])
+			}
 			return err
 		}
 		if action == "remove" {
@@ -400,6 +416,25 @@ func cmdRecipients(args []string) error {
 		printRecipients(*rc)
 		return nil
 	}
+}
+
+// writeKeys wraps the repo key to rc and replaces the key files.
+func writeKeys(ctx context.Context, r *remote.Remote, rc remote.Recipients) error {
+	objs, err := wrapKeys(r.Key, rc)
+	if err != nil {
+		return err
+	}
+	return storeKeys(ctx, r.Store, objs)
+}
+
+// syncKeys rewrites the key files from the latest manifest's recipients. The
+// manifest is authoritative; the key files are unauthenticated copies.
+func syncKeys(ctx context.Context, r *remote.Remote) error {
+	cur, err := r.Latest(ctx)
+	if err != nil {
+		return err
+	}
+	return writeKeys(ctx, r, cur.Recipients)
 }
 
 func printRecipients(rc remote.Recipients) {

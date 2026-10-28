@@ -538,3 +538,40 @@ func TestKeyCacheDirOverride(t *testing.T) {
 		t.Fatalf("lock with override touched the main keystore: %v", main)
 	}
 }
+
+// An interrupted or losing `recipients` writer can leave key files that match
+// no manifest. `recipients sync` rewrites them from the manifest.
+func TestRecipientsSyncRepairsKeyFiles(t *testing.T) {
+	e := newEnv(t)
+	id2, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2File := filepath.Join(e.root, "id2.txt")
+	os.WriteFile(id2File, []byte(id2.String()+"\n"), 0o600)
+	keyFile := filepath.Join(e.root, "remote", "keys", "age.age")
+	oldKeys, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.kura("recipients", e.url, "add", "--age", id2.Recipient().String())
+	// A concurrent writer that read the old list overwrites the key files,
+	// then dies before committing.
+	if err := os.WriteFile(keyFile, oldKeys, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.kura("lock", e.url)
+	out, err := e.cmd(e.root, kuraBin, "unlock", e.url, "-i", id2File)
+	if err == nil || !strings.Contains(out, "recipients <url> sync") {
+		t.Fatalf("unlock with key files missing a recipient: err=%v\n%s", err, out)
+	}
+
+	e.kura("unlock", e.url, "-i", e.identity)
+	out = e.kura("recipients", e.url, "sync")
+	if !strings.Contains(out, id2.Recipient().String()) {
+		t.Fatalf("recipients sync output:\n%s", out)
+	}
+	e.kura("lock", e.url)
+	e.kura("unlock", e.url, "-i", id2File)
+}

@@ -40,6 +40,9 @@ var (
 	// ErrUnknownOutcome means a manifest write may or may not have landed.
 	// Callers must not delete anything that write referenced.
 	ErrUnknownOutcome = errors.New("remote: manifest write outcome unknown")
+	// ErrStale means a manifest would reference a pack stored longer than
+	// UploadDeadline ago, which a concurrent gc may already have deleted.
+	ErrStale = errors.New("remote: uploaded pack is too old to commit")
 )
 
 // Config is the only plaintext metadata on the remote. RepoID is bound into
@@ -155,6 +158,8 @@ type Pack struct {
 	Created time.Time `json:"created"`
 	Size    int64     `json:"size"`
 	Parts   []Part    `json:"parts"`
+
+	stored time.Time // wall clock when UploadPack stored the last part; zero if read from a manifest
 }
 
 // Part is one stored chunk of an encrypted pack.
@@ -333,6 +338,9 @@ func (r *Remote) advance(s *Snapshot) error {
 // Commit writes next as the successor of prev. It returns ErrConflict if
 // another writer took that sequence number.
 func (r *Remote) Commit(ctx context.Context, prev *Snapshot, next *Manifest) (*Snapshot, error) {
+	if err := r.checkNewPacks(ctx, prev, next); err != nil {
+		return nil, err
+	}
 	next.Version = crypt.FormatVersion
 	next.Seq = prev.Seq + 1
 	next.Prev = prev.Hash
@@ -346,6 +354,24 @@ func (r *Remote) Commit(ctx context.Context, prev *Snapshot, next *Manifest) (*S
 		return nil, err
 	}
 	return s, r.advance(s)
+}
+
+// checkNewPacks makes sure every pack next adds is fully stored and fresh
+// enough that gc cannot have deleted it as an orphan. It returns ErrStale for a
+// pack stored more than UploadDeadline ago.
+func (r *Remote) checkNewPacks(ctx context.Context, prev *Snapshot, next *Manifest) error {
+	for _, p := range next.Packs {
+		if prev.HasPack(p.ID) {
+			continue
+		}
+		if err := r.VerifyPackStored(ctx, p); err != nil {
+			return err
+		}
+		if p.Stale() {
+			return fmt.Errorf("%w: pack %s", ErrStale, p.ID)
+		}
+	}
+	return nil
 }
 
 func (r *Remote) put(ctx context.Context, m *Manifest) (*Snapshot, error) {

@@ -25,9 +25,8 @@ type update struct {
 
 // builtPack is an uploaded pack plus what it was built against.
 type builtPack struct {
-	pack     *remote.Pack // nil when there were no new objects
-	against  []string     // pack ids in the manifest it was built against
-	uploaded time.Time
+	pack    *remote.Pack // nil when there were no new objects
+	against []string     // pack ids in the manifest it was built against
 }
 
 // push handles a batch of "push [+]<src>:<dst>" lines and commits all
@@ -109,16 +108,6 @@ func (h *helper) push(ctx context.Context, batch []string) error {
 				return err
 			}
 		}
-		if bp.pack != nil {
-			if err := r.VerifyPackStored(ctx, *bp.pack); err != nil {
-				return err
-			}
-		}
-		if bp.stale() {
-			// Uploading took longer than gc's safety margin allows.
-			discard()
-			continue
-		}
 
 		next := s.Clone()
 		for _, u := range accepted {
@@ -141,6 +130,12 @@ func (h *helper) push(ctx context.Context, batch []string) error {
 		h.chooseHead(next)
 
 		committed, err := r.Commit(ctx, s, next)
+		if errors.Is(err, remote.ErrStale) && attempt < maxPushAttempts {
+			// The machine slept between upload and commit; gc may have
+			// deleted the pack, so upload a new one.
+			discard()
+			continue
+		}
 		if errors.Is(err, remote.ErrConflict) && attempt < maxPushAttempts {
 			h.progressf("kura: remote changed during push, retrying (%d)", attempt)
 			time.Sleep(time.Duration(attempt*attempt) * 50 * time.Millisecond)
@@ -209,10 +204,9 @@ func (h *helper) check(u *update, s *remote.Snapshot) string {
 	return ""
 }
 
-// stale reports whether the upload is too old to commit, measured on the wall
-// clock (Go's monotonic clock stops while a Mac sleeps).
+// stale reports whether the uploaded pack is too old to commit.
 func (bp *builtPack) stale() bool {
-	return time.Now().Round(0).Sub(bp.uploaded) > remote.UploadDeadline
+	return bp.pack != nil && bp.pack.Stale()
 }
 
 // landed reports whether s already contains our push: our pack (whose random
@@ -243,7 +237,7 @@ func compacted(against []string, s *remote.Snapshot) bool {
 }
 
 func (h *helper) buildPack(ctx context.Context, accepted []*update, s *remote.Snapshot) (*builtPack, error) {
-	bp := &builtPack{uploaded: time.Now().Round(0)}
+	bp := &builtPack{}
 	for _, p := range s.Packs {
 		bp.against = append(bp.against, p.ID)
 	}

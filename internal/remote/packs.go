@@ -59,6 +59,7 @@ func (r *Remote) UploadPack(ctx context.Context, src io.Reader, size int64) (Pac
 		}
 		p.Parts = append(p.Parts, Part{SHA256: hex.EncodeToString(h.Sum(nil)), Size: n})
 	}
+	p.stored = time.Now().Round(0)
 	return p, nil
 }
 
@@ -145,10 +146,17 @@ func (r *Remote) DeletePack(ctx context.Context, p Pack) error {
 	return nil
 }
 
-// UploadDeadline is how old an upload may be before Commit refuses to
-// reference it, so a laptop that slept mid-push cannot commit packs that a
-// concurrent gc may have treated as orphans.
+// UploadDeadline is how long after storing a pack's last part Commit will
+// still reference it, so a laptop that slept between upload and commit cannot
+// commit packs that a concurrent gc may have treated as orphans.
 const UploadDeadline = time.Hour
+
+// Stale reports whether p was stored too long ago to commit, measured on the
+// wall clock (Go's monotonic clock stops while a Mac sleeps). A pack read from
+// a manifest has no upload time and is always stale.
+func (p Pack) Stale() bool {
+	return p.stored.IsZero() || time.Now().Round(0).Sub(p.stored) > UploadDeadline
+}
 
 // HumanBytes formats a byte count for progress messages.
 func HumanBytes(n int64) string {

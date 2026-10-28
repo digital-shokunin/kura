@@ -22,7 +22,7 @@ Usage:
   kura lock <url>
   kura fingerprint <url>
   kura info <url>
-  kura recipients <url> list
+  kura recipients <url> list|sync
   kura recipients <url> add|remove [--age R]... [--gpg FPR]...
   kura verify <url> [--repo DIR]
   kura compact <url>
