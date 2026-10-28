@@ -116,8 +116,9 @@ const MergeThreshold = 24
 // MergeIncremental replaces Packs[1:] with a single pack built from the
 // pusher's local repository: every object reachable from the current refs but
 // not from Base, which Packs[0] already contains. Only the small incremental
-// history is re-uploaded. It returns nil if there was nothing to do or the
-// local repository lacks a ref tip; a conflict just defers the merge.
+// history is re-uploaded. It returns nil if there was nothing to do, the
+// local repository lacks a ref tip, or its history is cut short by a shallow
+// boundary or graft; a conflict just defers the merge.
 func (r *Remote) MergeIncremental(ctx context.Context, g *gitcmd.Git, cur *Snapshot) (*Snapshot, error) {
 	if len(cur.Packs) <= MergeThreshold || cur.Base == nil {
 		return nil, nil
@@ -142,6 +143,14 @@ func (r *Remote) MergeIncremental(ctx context.Context, g *gitcmd.Git, cur *Snaps
 	}
 	sort.Strings(tips)
 	sort.Strings(exclude)
+	// The walk would stop at a shallow boundary and silently leave out
+	// older incremental objects that only the replaced packs hold.
+	if cut, err := g.CrossesGraft(tips, exclude); err != nil || cut {
+		if cut {
+			r.logf("kura: not merging incremental packs from a shallow or grafted repository")
+		}
+		return nil, err
+	}
 	f, err := os.CreateTemp("", "kura-merge-*.pack")
 	if err != nil {
 		return nil, err

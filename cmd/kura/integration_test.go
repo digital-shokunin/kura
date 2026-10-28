@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"filippo.io/age"
+
+	"github.com/digital-shokunin/kura/internal/remote"
 )
 
 var kuraBin string
@@ -574,4 +576,91 @@ func TestRecipientsSyncRepairsKeyFiles(t *testing.T) {
 	}
 	e.kura("lock", e.url)
 	e.kura("unlock", e.url, "-i", id2File)
+}
+
+// A shallow repository's history walk stops at its shallow boundary, so a
+// merge built from it would drop older incremental objects from the remote.
+func TestShallowPusherDoesNotMerge(t *testing.T) {
+	e := newEnv(t)
+	a := e.newRepo("a", "main")
+	e.commit(a, "base.md", "base\n")
+	e.git(a, "push", "-q", "-u", "origin", "main")
+	for i := range remote.MergeThreshold - 1 {
+		e.commit(a, fmt.Sprintf("n%02d.md", i), fmt.Sprintf("note %d\n", i))
+		e.git(a, "push", "-q")
+	}
+	s := filepath.Join(e.root, "s")
+	e.git(e.root, "clone", "-q", "--depth", "2", "file://"+a, s)
+	e.git(s, "remote", "add", "kura", e.url)
+	e.commit(s, "shallow.md", "from a shallow clone\n")
+	e.git(s, "push", "-q", "kura", "main")
+	if out := e.kura("info", e.url); !strings.Contains(out, fmt.Sprintf("Packs:         %d ", remote.MergeThreshold+1)) {
+		t.Fatalf("a shallow repository merged packs:\n%s", out)
+	}
+	fresh := e.clone("fresh")
+	if got := e.git(fresh, "rev-list", "--count", "HEAD"); got != fmt.Sprint(remote.MergeThreshold+1) {
+		t.Fatalf("fresh clone has %s commits", got)
+	}
+	e.kura("verify", e.url)
+
+	// Pushing the shallow history itself to an empty remote is refused.
+	e2 := newEnv(t)
+	if out := e2.gitFail(s, "push", e2.url, "main"); !strings.Contains(out, "--unshallow") {
+		t.Fatalf("push of shallow history:\n%s", out)
+	}
+}
+
+// Packs stay referenced after every ref is deleted, so the object format
+// recorded with them still applies.
+func TestObjectFormatFixedOnceStored(t *testing.T) {
+	e := newEnv(t)
+	a := e.newRepo("a", "main")
+	e.commit(a, "f", "sha1 content")
+	e.git(a, "push", "-q", "origin", "main")
+	e.git(a, "push", "-q", "origin", ":main")
+	s := filepath.Join(e.root, "s")
+	e.git(e.root, "init", "-q", "-b", "main", "--object-format=sha256", s)
+	e.git(s, "remote", "add", "origin", e.url)
+	e.commit(s, "g", "sha256 content")
+	if out := e.gitFail(s, "push", "origin", "main"); !strings.Contains(out, "remote uses sha1") {
+		t.Fatalf("sha256 push into a remote holding sha1 packs:\n%s", out)
+	}
+}
+
+// config.json is plaintext. If its repo id is swapped for another cached
+// repository's, lock must not delete that key and report success.
+func TestLockChecksRepoID(t *testing.T) {
+	e := newEnv(t)
+	e.kura("init", "file://"+filepath.Join(e.root, "other"), "--age", e.recipient)
+	keys := func() int {
+		got, _ := filepath.Glob(filepath.Join(e.root, "keystore", "kura", "*"))
+		return len(got)
+	}
+	if keys() != 2 {
+		t.Fatalf("expected two cached keys, found %d", keys())
+	}
+	cfg := filepath.Join(e.root, "remote", "config.json")
+	orig, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := os.ReadFile(filepath.Join(e.root, "other", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cfg, other, 0o644)
+	if out, err := e.cmd(e.root, kuraBin, "lock", e.url); err == nil || !strings.Contains(out, "Nothing was removed") {
+		t.Fatalf("lock with a swapped repo id: err=%v\n%s", err, out)
+	}
+	if keys() != 2 {
+		t.Fatalf("lock removed a key: %d left", keys())
+	}
+	os.WriteFile(cfg, orig, 0o644)
+	e.kura("lock", e.url)
+	if keys() != 1 {
+		t.Fatalf("lock left %d keys, want 1", keys())
+	}
+	if out := e.kura("lock", e.url); !strings.Contains(out, "No key cached") {
+		t.Fatalf("second lock:\n%s", out)
+	}
 }

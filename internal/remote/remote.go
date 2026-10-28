@@ -15,7 +15,10 @@ import (
 	"maps"
 	"os"
 	"regexp"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/digital-shokunin/kura/internal/crypt"
 	"github.com/digital-shokunin/kura/internal/store"
@@ -30,7 +33,8 @@ const (
 	maxSeq = 1 << 40
 )
 
-var repoIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+// idPattern matches repo ids and pack ids.
+var idPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 var (
 	// ErrConflict means another writer committed the next manifest first.
@@ -69,7 +73,7 @@ func LoadConfig(ctx context.Context, s store.Store) (Config, error) {
 	if c.Format != formatName || c.Version != crypt.FormatVersion {
 		return c, fmt.Errorf("remote: unsupported repository format %q v%d", c.Format, c.Version)
 	}
-	if !repoIDPattern.MatchString(c.RepoID) {
+	if !idPattern.MatchString(c.RepoID) {
 		return c, fmt.Errorf("remote: malformed repo id in %s", configKey)
 	}
 	return c, nil
@@ -189,6 +193,62 @@ func (m *Manifest) Clone() *Manifest {
 	return &c
 }
 
+// validate rejects values kura never writes. Ref names, object ids and pack
+// ids end up in git's remote-helper protocol, on git command lines and in
+// storage keys, so a manifest from another key holder must not be able to
+// inject protocol lines, options or path segments through them.
+func (m *Manifest) validate() error {
+	idLen := map[string]int{"sha1": 40, "sha256": 64}[m.Format()]
+	if idLen == 0 {
+		return fmt.Errorf("unknown object format %q", m.ObjectFormat)
+	}
+	for _, refs := range []map[string]string{m.Refs, m.Base} {
+		for name, id := range refs {
+			if !ValidRefName(name) {
+				return fmt.Errorf("invalid ref name %q", name)
+			}
+			if len(id) != idLen || strings.Trim(id, "0123456789abcdef") != "" {
+				return fmt.Errorf("invalid object id %q for %s", id, name)
+			}
+		}
+	}
+	if m.Head != "" && !ValidRefName(m.Head) {
+		return fmt.Errorf("invalid HEAD %q", m.Head)
+	}
+	for _, p := range m.Packs {
+		if !idPattern.MatchString(p.ID) {
+			return fmt.Errorf("invalid pack id %q", p.ID)
+		}
+	}
+	for _, text := range append(append([]string{m.Writer}, m.Recipients.Age...), m.Recipients.GPG...) {
+		if strings.IndexFunc(text, unicode.IsControl) >= 0 {
+			return fmt.Errorf("control character in %q", text)
+		}
+	}
+	return nil
+}
+
+// ValidRefName reports whether name is a full ref name under refs/ that git
+// accepts (see git-check-ref-format) and JSON can carry unchanged.
+func ValidRefName(name string) bool {
+	if !strings.HasPrefix(name, "refs/") || !utf8.ValidString(name) ||
+		strings.HasSuffix(name, "/") || strings.HasSuffix(name, ".") ||
+		strings.Contains(name, "//") || strings.Contains(name, "..") || strings.Contains(name, "@{") {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c == 0x7f || strings.IndexByte(" ~^:?*[\\", c) >= 0 {
+			return false
+		}
+	}
+	for _, part := range strings.Split(name, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
 // HasPack reports whether the manifest references pack id.
 func (m *Manifest) HasPack(id string) bool {
 	for _, p := range m.Packs {
@@ -223,6 +283,9 @@ func (r *Remote) readManifest(ctx context.Context, seq uint64) (*Snapshot, error
 	}
 	if m.Refs == nil {
 		m.Refs = map[string]string{}
+	}
+	if err := m.validate(); err != nil {
+		return nil, fmt.Errorf("remote: manifest %d: %w", seq, err)
 	}
 	return &Snapshot{Manifest: &m, Hash: hashHex(ct)}, nil
 }
@@ -375,6 +438,9 @@ func (r *Remote) checkNewPacks(ctx context.Context, prev *Snapshot, next *Manife
 }
 
 func (r *Remote) put(ctx context.Context, m *Manifest) (*Snapshot, error) {
+	if err := m.validate(); err != nil {
+		return nil, fmt.Errorf("remote: refusing to write manifest %d: %w", m.Seq, err)
+	}
 	plain, err := json.Marshal(m)
 	if err != nil {
 		return nil, err

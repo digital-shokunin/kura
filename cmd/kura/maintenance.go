@@ -219,14 +219,14 @@ func cmdVerify(args []string) error {
 	}
 	if *local != "" {
 		for _, ref := range refs {
-			sha, err := run(*local, os.Environ(), "git", "rev-parse", "--verify", "--quiet", ref)
+			sha, err := run(*local, os.Environ(), "git", "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
 			if err != nil || strings.TrimSpace(sha) != latest.Refs[ref] {
 				problems = append(problems, fmt.Sprintf("local %s is %q, remote is %s", ref, strings.TrimSpace(sha), latest.Refs[ref]))
 			}
 		}
 		if latest.Head != "" {
-			lt, err1 := run(*local, os.Environ(), "git", "rev-parse", "HEAD^{tree}")
-			rt, err2 := run(mirror, env, "git", "rev-parse", latest.Head+"^{tree}")
+			lt, err1 := run(*local, os.Environ(), "git", "rev-parse", "--verify", "HEAD^{tree}")
+			rt, err2 := run(mirror, env, "git", "rev-parse", "--verify", "--end-of-options", latest.Head+"^{tree}")
 			if err1 != nil || err2 != nil || strings.TrimSpace(lt) != strings.TrimSpace(rt) {
 				problems = append(problems, fmt.Sprintf("local HEAD tree %s differs from remote %s tree %s",
 					strings.TrimSpace(lt), latest.Head, strings.TrimSpace(rt)))

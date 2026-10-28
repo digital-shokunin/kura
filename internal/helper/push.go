@@ -75,7 +75,10 @@ func (h *helper) push(ctx context.Context, batch []string) error {
 	discard := func() { bp = nil }
 
 	for attempt := 1; ; attempt++ {
-		if len(s.Refs) > 0 && s.Format() != h.objectFormat {
+		// The object format is fixed once anything is stored, including
+		// packs left behind after every ref was deleted.
+		empty := len(s.Refs) == 0 && len(s.Packs) == 0
+		if !empty && s.Format() != h.objectFormat {
 			return fmt.Errorf("local repository uses %s object ids but the remote uses %s", h.objectFormat, s.Format())
 		}
 		var accepted []*update
@@ -124,7 +127,7 @@ func (h *helper) push(ctx context.Context, batch []string) error {
 				next.Base = maps.Clone(next.Refs)
 			}
 		}
-		if next.ObjectFormat == "" && len(s.Refs) == 0 {
+		if empty {
 			next.ObjectFormat = h.objectFormat
 		}
 		h.chooseHead(next)
@@ -180,6 +183,9 @@ func (h *helper) push(ctx context.Context, batch []string) error {
 // check validates one update against the current manifest, returning the
 // rejection reason git understands, or "".
 func (h *helper) check(u *update, s *remote.Snapshot) string {
+	if !remote.ValidRefName(u.dst) {
+		return "invalid ref name"
+	}
 	old, exists := s.Refs[u.dst]
 	if lease, ok := h.opts.cas[u.dst]; ok {
 		if (lease == "" && exists) || (lease != "" && lease != old) {
@@ -258,6 +264,15 @@ func (h *helper) buildPack(ctx context.Context, accepted []*update, s *remote.Sn
 		}
 	}
 	sort.Strings(exclude)
+	// A remote server would catch this with a connectivity check; kura has
+	// no server, so refuse to upload commits whose real parents are unknown.
+	if cut, err := h.git.CrossesGraft(include, exclude); err != nil {
+		return nil, err
+	} else if cut {
+		return nil, errors.New("kura: this push reaches a shallow boundary or grafted commit, " +
+			"so the remote could be left without its parents; run `git fetch --unshallow` " +
+			"(or remove .git/info/grafts) and push again")
+	}
 
 	tmp, err := os.CreateTemp("", "kura-push-*.pack")
 	if err != nil {

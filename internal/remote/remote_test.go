@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -48,7 +51,14 @@ func (f *fixture) client(t *testing.T, name string) *Remote {
 	return &Remote{Store: f.store, RepoID: f.id, Key: f.key, State: st}
 }
 
-func push(t *testing.T, r *Remote, ref, sha string) *Snapshot {
+// oid returns a well-formed sha1 object id named by label.
+func oid(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:20])
+}
+
+// push commits ref at oid(label).
+func push(t *testing.T, r *Remote, ref, label string) *Snapshot {
 	t.Helper()
 	ctx := context.Background()
 	cur, err := r.Latest(ctx)
@@ -56,7 +66,7 @@ func push(t *testing.T, r *Remote, ref, sha string) *Snapshot {
 		t.Fatal(err)
 	}
 	next := cur.Clone()
-	next.Refs[ref] = sha
+	next.Refs[ref] = oid(label)
 	s, err := r.Commit(ctx, cur, next)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +95,7 @@ func TestLatestFollowsChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Seq != 9 || got.Refs["refs/heads/main"] != "i" {
+	if got.Seq != 9 || got.Refs["refs/heads/main"] != oid("i") {
 		t.Fatalf("fresh client saw seq %d refs %v", got.Seq, got.Refs)
 	}
 	push(t, a, "refs/heads/main", "z")
@@ -102,8 +112,8 @@ func TestConcurrentCommitConflicts(t *testing.T) {
 	ca, _ := a.Latest(ctx)
 	cb, _ := b.Latest(ctx)
 	na, nb := ca.Clone(), cb.Clone()
-	na.Refs["refs/heads/a"] = "1"
-	nb.Refs["refs/heads/b"] = "2"
+	na.Refs["refs/heads/a"] = oid("1")
+	nb.Refs["refs/heads/b"] = oid("2")
 	if _, err := a.Commit(ctx, ca, na); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +146,7 @@ func TestForkDetected(t *testing.T) {
 	// verified it. The new one is validly encrypted but a different branch.
 	writer := &Remote{Store: f.store, RepoID: f.id, Key: f.key}
 	f.store.Delete(context.Background(), manifestKey(2))
-	m2 := &Manifest{Version: 1, Seq: 2, Refs: map[string]string{"refs/heads/main": "other"}}
+	m2 := &Manifest{Version: 1, Seq: 2, Refs: map[string]string{"refs/heads/main": oid("other")}}
 	if _, err := writer.put(context.Background(), m2); err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +380,7 @@ func TestCommitRefusesStaleOrMissingPack(t *testing.T) {
 		t.Fatalf("fresh pack: %v", err)
 	}
 	// Packs already in the previous manifest are not re-checked.
-	push(t, a, "refs/heads/main", "0123456789012345678901234567890123456789")
+	push(t, a, "refs/heads/main", "1")
 }
 
 func TestGCKeepsPackWithRecentPart(t *testing.T) {
@@ -449,5 +459,62 @@ func TestGCIgnoresSlowWriterClock(t *testing.T) {
 	}
 	if len(res.Deleted) != 0 {
 		t.Fatalf("gc deleted %v, which manifests written minutes ago reference", res.Deleted)
+	}
+}
+
+func TestValidRefName(t *testing.T) {
+	for _, name := range []string{"refs/heads/main", "refs/tags/v1.0", "refs/heads/feature/ü", "refs/notes/commits"} {
+		if !ValidRefName(name) {
+			t.Errorf("rejected %q", name)
+		}
+	}
+	for _, name := range []string{"", "HEAD", "main", "refs/", "refs/heads/a\n0000 refs/heads/b", "refs/heads/a b",
+		"refs/heads/-x/../y", "refs/heads/a..b", "refs/heads/.hidden", "refs/heads/a.lock", "refs/heads/a/",
+		"refs/heads//a", "refs/heads/a.", "refs/heads/a@{1}", "refs/heads/a~1", "refs/heads/a^", "refs/heads/a:b",
+		"refs/heads/a?", "refs/heads/a*", "refs/heads/a[", "refs/heads/a\\b", "refs/heads/\x1b[31m", "refs/heads/\xff"} {
+		if ValidRefName(name) {
+			t.Errorf("accepted %q", name)
+		}
+	}
+}
+
+// Manifest fields reach git's helper protocol, command lines and storage
+// keys. A key holder who writes a malformed manifest directly must not get
+// it past a reader.
+func TestMalformedManifestRejected(t *testing.T) {
+	ctx := context.Background()
+	for name, mutate := range map[string]func(*Manifest){
+		"ref name with newline": func(m *Manifest) { m.Refs["refs/heads/a\n\nlock /etc/passwd"] = oid("a") },
+		"option-like object id": func(m *Manifest) { m.Refs["refs/heads/main"] = "--output=/tmp/x" },
+		"short object id":       func(m *Manifest) { m.Refs["refs/heads/main"] = "abc" },
+		"head":                  func(m *Manifest) { m.Head = "refs/heads/main\n" },
+		"base":                  func(m *Manifest) { m.Base = map[string]string{"refs/heads/main": "-x"} },
+		"pack id":               func(m *Manifest) { m.Packs = []Pack{{ID: "../config.json"}} },
+		"object format":         func(m *Manifest) { m.ObjectFormat = "sha1\nfoo" },
+		"writer":                func(m *Manifest) { m.Writer = "host\x1b]0;title\x07" },
+		"recipient":             func(m *Manifest) { m.Recipients.Age = []string{"age1\nx"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			a := f.client(t, "a")
+			cur := push(t, a, "refs/heads/main", "1")
+			next := cur.Clone()
+			mutate(next)
+			// Commit sets the writer itself.
+			if _, err := a.Commit(ctx, cur, next.Clone()); err == nil && name != "writer" {
+				t.Fatal("Commit wrote a malformed manifest")
+			}
+			// Write it anyway, as a modified client would.
+			next.Version, next.Seq, next.Prev = crypt.FormatVersion, cur.Seq+1, cur.Hash
+			plain, _ := json.Marshal(next)
+			ct, err := f.key.Seal(plain, f.id, manifestKey(next.Seq))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.store.Put(ctx, manifestKey(next.Seq), bytes.NewReader(ct), int64(len(ct)))
+			if _, err := f.client(t, "b").Latest(ctx); err == nil {
+				t.Fatal("reader accepted a malformed manifest")
+			}
+		})
 	}
 }

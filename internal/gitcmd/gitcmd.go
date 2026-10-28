@@ -175,14 +175,7 @@ func (g *Git) ObjectsConnected(wants []string) bool {
 // exclude to w and returns the number of objects in it. Packs are not thin,
 // so each one is self-contained given the packs before it.
 func (g *Git) PackObjects(w io.Writer, include, exclude []string) (uint32, error) {
-	var revs strings.Builder
-	for _, s := range include {
-		fmt.Fprintln(&revs, s)
-	}
-	for _, s := range exclude {
-		fmt.Fprintln(&revs, "^"+s)
-	}
-	cmd := g.command(strings.NewReader(revs.String()),
+	cmd := g.command(revs(include, exclude),
 		"pack-objects", "--revs", "--stdout", "--delta-base-offset", "-q")
 	hw := &headerWriter{w: w}
 	cmd.Stdout = hw
@@ -193,6 +186,54 @@ func (g *Git) PackObjects(w io.Writer, include, exclude []string) (uint32, error
 		return 0, errors.New("git pack-objects: missing pack header")
 	}
 	return binary.BigEndian.Uint32(hw.hdr[8:12]), nil
+}
+
+// revs is the stdin for a --revs or --stdin walk of include minus exclude.
+func revs(include, exclude []string) io.Reader {
+	var b strings.Builder
+	for _, s := range include {
+		fmt.Fprintln(&b, s)
+	}
+	for _, s := range exclude {
+		fmt.Fprintln(&b, "^"+s)
+	}
+	return strings.NewReader(b.String())
+}
+
+// CrossesGraft reports whether the commits reachable from include but not
+// from exclude contain a shallow boundary (.git/shallow) or a grafted commit
+// (.git/info/grafts). Git walks such a commit as if it had no parents, or
+// different ones, so a pack built from the range can silently lack objects
+// that its commits need.
+func (g *Git) CrossesGraft(include, exclude []string) (bool, error) {
+	cut := map[string]bool{}
+	for _, name := range []string{"shallow", filepath.Join("info", "grafts")} {
+		b, err := os.ReadFile(filepath.Join(g.commonDir(), name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) > 0 && !strings.HasPrefix(f[0], "#") {
+				cut[f[0]] = true
+			}
+		}
+	}
+	if len(cut) == 0 || len(include) == 0 {
+		return false, nil
+	}
+	out, err := g.output(revs(include, exclude), "rev-list", "--stdin")
+	if err != nil {
+		return false, err
+	}
+	for _, sha := range strings.Fields(out) {
+		if cut[sha] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type headerWriter struct {

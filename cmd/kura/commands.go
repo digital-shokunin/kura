@@ -300,6 +300,21 @@ func cmdLock(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The repo id comes from plaintext config.json. Check that the slot it
+	// names holds this repository's key, so an altered id can't make lock
+	// remove a different key and leave this one cached.
+	k, err := cache.Get(cfg.RepoID)
+	if errors.Is(err, keyring.ErrNotCached) {
+		fmt.Printf("No key cached for %s in %s\n", cfg.RepoID, cache.Name())
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if t.Fingerprint != "" && k.Fingerprint(cfg.RepoID) != t.Fingerprint {
+		return fmt.Errorf("the key cached for repo %s does not match the pinned fingerprint %s; "+
+			"the remote's config.json may have been altered. Nothing was removed", cfg.RepoID, t.Fingerprint)
+	}
 	if err := cache.Delete(cfg.RepoID); err != nil {
 		return err
 	}
