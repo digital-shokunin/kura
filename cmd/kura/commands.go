@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -95,16 +96,22 @@ func wrapKeys(k crypt.Key, rc remote.Recipients) (map[string][]byte, error) {
 	return objs, nil
 }
 
+// storeKeys writes every key file before deleting any, so a failure part way
+// never leaves a recipient of both the old and the new list without one.
 func storeKeys(ctx context.Context, s store.Store, objs map[string][]byte) error {
-	for key, data := range objs {
-		var err error
-		if data == nil {
-			err = s.Delete(ctx, key)
-		} else {
-			err = s.Put(ctx, key, bytes.NewReader(data), int64(len(data)))
+	keys := slices.Sorted(maps.Keys(objs))
+	for _, key := range keys {
+		if data := objs[key]; data != nil {
+			if err := s.Put(ctx, key, bytes.NewReader(data), int64(len(data))); err != nil {
+				return err
+			}
 		}
-		if err != nil {
-			return err
+	}
+	for _, key := range keys {
+		if objs[key] == nil {
+			if err := s.Delete(ctx, key); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -407,16 +414,17 @@ func cmdRecipients(args []string) error {
 		}
 		// The key files go first so the new list can unlock as soon as a
 		// manifest records it; the next attempt rewrites them from fresh state.
-		if err := writeKeys(ctx, r, *rc); err != nil {
-			return err
-		}
-		_, err = r.Commit(ctx, cur, next)
-		if errors.Is(err, remote.ErrConflict) && attempt < 5 {
-			continue
+		err = writeKeys(ctx, r, *rc)
+		if err == nil {
+			_, err = r.Commit(ctx, cur, next)
+			if errors.Is(err, remote.ErrConflict) && attempt < 5 {
+				continue
+			}
 		}
 		if err != nil {
-			// The key files now match no manifest, and a concurrent writer's
-			// recipients may be missing from them. Restore the recorded list.
+			// The key files may now match no manifest, and a concurrent
+			// writer's recipients may be missing from them. Restore the
+			// recorded list.
 			if serr := syncKeys(ctx, r); serr != nil {
 				fmt.Fprintf(os.Stderr, "kura: warning: key files may not match the manifest (%v); "+
 					"run `kura recipients '%s' sync`\n", serr, pos[0])
