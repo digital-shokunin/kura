@@ -610,6 +610,38 @@ func TestShallowPusherDoesNotMerge(t *testing.T) {
 	}
 }
 
+// A pusher missing some of Base's tips excludes less from the merged pack,
+// which is then larger but still complete: Packs[0] holds the rest.
+func TestMergeWithoutBaseTips(t *testing.T) {
+	e := newEnv(t)
+	a := e.newRepo("a", "main")
+	e.commit(a, "base.md", "base\n")
+	e.git(a, "checkout", "-q", "-b", "side")
+	side := e.commit(a, "side.md", "side\n")
+	e.git(a, "checkout", "-q", "main")
+	e.git(a, "push", "-q", "origin", "main", "side") // Base = {main, side}
+	e.git(a, "push", "-q", "origin", ":side")
+	e.git(a, "branch", "-q", "-D", "side")
+
+	// b has main's history from a, but never side's objects.
+	b := filepath.Join(e.root, "b")
+	e.git(e.root, "clone", "-q", "file://"+a, b)
+	e.gitFail(b, "cat-file", "-e", side)
+	e.git(b, "remote", "add", "kura", e.url)
+	for i := range remote.MergeThreshold {
+		e.commit(b, fmt.Sprintf("n%02d.md", i), fmt.Sprintf("note %d\n", i))
+		e.git(b, "push", "-q", "kura", "main")
+	}
+	if out := e.kura("info", e.url); !strings.Contains(out, "Packs:         2 ") {
+		t.Fatalf("expected incremental packs to be merged down to 2:\n%s", out)
+	}
+	fresh := e.clone("fresh")
+	if got := e.git(fresh, "rev-list", "--count", "HEAD"); got != fmt.Sprint(remote.MergeThreshold+1) {
+		t.Fatalf("fresh clone has %s commits", got)
+	}
+	e.kura("verify", e.url, "--repo", b)
+}
+
 // Packs stay referenced after every ref is deleted, so the object format
 // recorded with them still applies.
 func TestObjectFormatFixedOnceStored(t *testing.T) {

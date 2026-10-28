@@ -157,6 +157,8 @@ func (r *Remote) MergeIncremental(ctx context.Context, g *gitcmd.Git, cur *Snaps
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
+	// Unlike Compact, which only has the remote's packs, this needs no
+	// connectivity check: pack-objects fails on any object missing below a tip.
 	if _, err := g.PackObjects(f, tips, exclude); err != nil {
 		return nil, err
 	}
