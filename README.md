@@ -4,7 +4,7 @@ kura (蔵, a traditional fireproof storehouse) gives you end-to-end encrypted gi
 
 There's no daemon or server component: git runs `git-remote-kura` when you push or fetch a `kura::` URL. The storage provider sees only ciphertext. File names, contents, commit messages, branch names and authors are all hidden, and the provider can't forge data, substitute keys, or roll the repository back without being detected.
 
-> **Status:** young and unaudited. The cryptography is standard (age, XChaCha20-Poly1305, HKDF-SHA256), but the composition hasn't been independently reviewed. Keep another backup.
+> **Status:** young and unaudited. The cryptography is standard (age, XChaCha20-Poly1305, HKDF-SHA256), but the composition hasn't been independently reviewed. Keep another backup. To report a vulnerability, see [SECURITY.md](SECURITY.md); it also states the threat model.
 
 ## How it works
 
@@ -189,6 +189,13 @@ make linux    # static linux/amd64 build
 
 Tests set `KURA_KEYSTORE_DIR`, so they never touch the real Keychain.
 
+To run the store conformance suite (including the put-if-absent race) against a live S3-compatible endpoint, as CI does with [versitygw]:
+
+```sh
+KURA_TEST_S3_URL='s3://BUCKET/ci?region=us-east-1&endpoint=http://127.0.0.1:7070&path_style=true' \
+  go test -run TestConformance ./internal/store/s3/
+```
+
 Both git object formats are supported: SHA-1 (the default) and SHA-256 (`git init --object-format=sha256`). The first push records the format, clones are created to match, and pushes from a repository in the other format are refused. Git's object ids are only content addresses; integrity against the storage provider comes from kura's authenticated encryption either way.
 
 ## Limitations
@@ -196,6 +203,7 @@ Both git object formats are supported: SHA-1 (the default) and SHA-256 (`git ini
 - Removing a recipient doesn't revoke a key it already unwrapped. Re-keying (`rotate`) isn't implemented yet.
 - The provider can see push timing and padded pack sizes.
 - An uploaded pack whose push never committed (crash, conflict) stays in storage until `kura gc`.
+- A push from a shallow clone is refused if it reaches the shallow boundary: with no server to run a connectivity check, kura can't tell whether the remote already has the missing parents. Run `git fetch --unshallow` first.
 
 ## License
 
@@ -207,3 +215,4 @@ BSD 3-Clause. See [LICENSE](LICENSE).
 [git-remote-gcrypt]: https://github.com/spwhitton/git-remote-gcrypt
 [git-crypt]: https://github.com/AGWA/git-crypt
 [git-remote-sealed]: https://github.com/hibariya/git-remote-sealed
+[versitygw]: https://github.com/versity/versitygw
