@@ -132,6 +132,8 @@ Local or NAS storage: `kura::file:///Volumes/nas/repos/notes`.
 ```sh
 kura unlock 'kura::s3://...?fp=...' -i ~/.config/kura/identities   # age / plugin identities
 kura unlock 'kura::s3://...?fp=...' --gpg                          # OpenPGP / smartcard
+kura unlock 'kura::s3://...?fp=...' --gpg-key AFD3E10F4B4F7882     # name the subkey: with several
+                                                                   # cards, gpg otherwise asks for each
 git clone 'kura::s3://...?fp=...' notes
 ```
 
@@ -151,23 +153,32 @@ kura info    'kura::...'                # fingerprint, object format, seq, refs,
 kura verify  'kura::...' [--repo DIR]   # fresh clone into a temp dir, fsck --strict, compare refs (and HEAD tree)
 kura compact 'kura::...'                # rewrite all packs into one
 kura gc      'kura::...' [--dry-run]    # delete packs unreferenced for 24 h
-kura recipients 'kura::...' list|add|remove [--age R] [--gpg FPR]
+kura recipients 'kura::...' list|add|remove|sync [--age R] [--gpg FPR]
 kura lock    'kura::...'                # forget the cached key on this machine
 ```
 
-`gc` only deletes a pack when no manifest written during the grace period references it and the pack itself is older than the grace period. In-flight pushes and readers are therefore safe.
+`gc` only deletes a pack when no manifest written during the grace period references it and its newest part is older than the grace period. A push refuses to commit a pack whose upload finished more than an hour ago (a laptop that slept in between), so in-flight pushes and readers are safe.
+
+The manifest's recipient list is authoritative; `keys/` holds copies of the wrapped key. If a `recipients` change is interrupted, a listed key may fail to unlock. `kura recipients 'kura::...' sync`, run on a machine with the key unlocked, rewrites `keys/` from the manifest.
 
 ## Recovery drill
 
 Do this after setup and periodically:
 
+Point `KURA_KEYCACHE_DIR` at a throwaway directory so each test unwraps the key from scratch without disturbing the key cached in your Keychain (S3 credentials are still read from it):
+
 ```sh
-kura lock 'kura::...'
-kura unlock 'kura::...' -i ~/.config/kura/identities && kura lock 'kura::...'
-kura unlock 'kura::...' --gpg && kura lock 'kura::...'
+export KURA_KEYCACHE_DIR=$(mktemp -d)
+kura unlock 'kura::...' -i ~/.config/kura/identities && rm -f "$KURA_KEYCACHE_DIR"/*/*
+kura unlock 'kura::...' --gpg-key KEYID && rm -f "$KURA_KEYCACHE_DIR"/*/*
 kura unlock 'kura::...' -i recovery.txt
-kura verify 'kura::...'
+rm -rf "$KURA_KEYCACHE_DIR"; unset KURA_KEYCACHE_DIR
 ```
+
+## Guides
+
+- [Using kura with an Obsidian vault](docs/obsidian.md): plugin settings, the PATH gotcha, phones
+- [Migrating a repository from Keybase git](docs/migrating-from-keybase.md): snapshot, optional history cleanup, `.git` swap, verification
 
 ## Development
 
