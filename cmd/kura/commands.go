@@ -189,6 +189,8 @@ func cmdUnlock(args []string) error {
 	var idFiles multiFlag
 	fs.Var(&idFiles, "i", "age identity file (native or plugin identities); repeatable")
 	useGPG := fs.Bool("gpg", false, "unwrap with gpg (e.g. a Yubikey OpenPGP key)")
+	var gpgKeys multiFlag
+	fs.Var(&gpgKeys, "gpg-key", "with --gpg: the secret (sub)key to try, so gpg asks for the right smartcard; repeatable")
 	fp := fs.String("fp", "", "expected key fingerprint, if not in the url")
 	force := fs.Bool("force", false, "unwrap again even if the key is already cached")
 	pos, err := parse(fs, args, 1)
@@ -214,6 +216,9 @@ func cmdUnlock(args []string) error {
 		}
 		fmt.Printf("Already unlocked (%s). Use --force to unwrap again.\n", cache.Name())
 		return nil
+	}
+	if len(gpgKeys) > 0 {
+		*useGPG = true
 	}
 	if len(idFiles) == 0 && !*useGPG {
 		if def := defaultIdentityFile(); def != "" {
@@ -248,7 +253,7 @@ func cmdUnlock(args []string) error {
 			return fmt.Errorf("reading %s: %w", keyring.GPGKeyPath, err)
 		}
 		fmt.Fprintln(os.Stderr, "kura: decrypting with gpg (your Yubikey may ask for its PIN and a touch)")
-		if k, err = keyring.UnwrapGPG(ct); err != nil {
+		if k, err = keyring.UnwrapGPG(ct, gpgKeys...); err != nil {
 			return err
 		}
 	}

@@ -160,14 +160,20 @@ func WrapGPG(k crypt.Key, fingerprints []string) ([]byte, error) {
 }
 
 // UnwrapGPG decrypts K with gpg, which may prompt for the smartcard PIN via
-// pinentry and require a touch.
-func UnwrapGPG(ct []byte) (crypt.Key, error) {
+// pinentry and require a touch. Because recipients are hidden, gpg otherwise
+// tries every secret encryption key in turn (asking for each smartcard);
+// tryKeys names the key(s) to try instead.
+func UnwrapGPG(ct []byte, tryKeys ...string) (crypt.Key, error) {
 	gpg, err := gpgPath()
 	if err != nil {
 		return crypt.Key{}, err
 	}
+	args := []string{"--quiet"}
+	for _, k := range tryKeys {
+		args = append(args, "--try-secret-key", strings.TrimSuffix(k, "!"))
+	}
 	var out bytes.Buffer
-	cmd := exec.Command(gpg, "--quiet", "--decrypt")
+	cmd := exec.Command(gpg, append(args, "--decrypt")...)
 	cmd.Stdin = bytes.NewReader(ct)
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr

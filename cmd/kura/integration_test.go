@@ -515,3 +515,26 @@ func TestRecipientsLiveInManifest(t *testing.T) {
 		t.Fatalf("removing the last recipient was allowed:\n%s", out)
 	}
 }
+
+func TestKeyCacheDirOverride(t *testing.T) {
+	e := newEnv(t)
+	cache := filepath.Join(e.root, "drill")
+	e.vars = append(e.vars, "KURA_KEYCACHE_DIR="+cache)
+	e.kura("unlock", e.url, "-i", e.identity)
+	keys, _ := filepath.Glob(filepath.Join(cache, "kura", "*"))
+	if len(keys) != 1 {
+		t.Fatalf("expected the unwrapped key in the override dir, found %v", keys)
+	}
+	// The main store still holds the key from init, untouched.
+	main, _ := filepath.Glob(filepath.Join(e.root, "keystore", "kura", "*"))
+	if len(main) != 1 {
+		t.Fatalf("main keystore changed: %v", main)
+	}
+	e.kura("lock", e.url)
+	if keys, _ := filepath.Glob(filepath.Join(cache, "kura", "*")); len(keys) != 0 {
+		t.Fatalf("lock did not clear the override dir: %v", keys)
+	}
+	if main, _ := filepath.Glob(filepath.Join(e.root, "keystore", "kura", "*")); len(main) != 1 {
+		t.Fatalf("lock with override touched the main keystore: %v", main)
+	}
+}

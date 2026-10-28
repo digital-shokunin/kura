@@ -18,7 +18,7 @@ const usage = `kura: end-to-end encrypted git remotes
 
 Usage:
   kura init <url> [--age R]... [--age-file F]... [--gpg FPR]...
-  kura unlock <url> [-i IDENTITY_FILE]... [--gpg] [--fp FINGERPRINT]
+  kura unlock <url> [-i IDENTITY_FILE]... [--gpg [--gpg-key KEYID]...] [--fp FINGERPRINT]
   kura lock <url>
   kura fingerprint <url>
   kura info <url>

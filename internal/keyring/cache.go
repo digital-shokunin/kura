@@ -27,6 +27,11 @@ type Secrets interface {
 // Tests use it so they never touch the real Keychain.
 const KeystoreDirEnv = "KURA_KEYSTORE_DIR"
 
+// KeyCacheDirEnv, when set, keeps only unwrapped repo keys in that directory;
+// other secrets (S3 credentials) still come from the platform store. Recovery
+// drills use it to test an unlock without replacing the cached key.
+const KeyCacheDirEnv = "KURA_KEYCACHE_DIR"
+
 // DefaultSecrets returns the login Keychain on macOS, or files under
 // ~/.config/kura elsewhere.
 func DefaultSecrets() (Secrets, error) {
@@ -46,8 +51,12 @@ var accountPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 // Cache stores unwrapped repo keys, keyed by repo id.
 type Cache struct{ Secrets }
 
-// DefaultCache returns the repo key cache on the platform secret store.
+// DefaultCache returns the repo key cache on the platform secret store, or
+// in KURA_KEYCACHE_DIR if set.
 func DefaultCache() (Cache, error) {
+	if dir := os.Getenv(KeyCacheDirEnv); dir != "" {
+		return Cache{&FileSecrets{Dir: dir}}, nil
+	}
 	s, err := DefaultSecrets()
 	return Cache{s}, err
 }
