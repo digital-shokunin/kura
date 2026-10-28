@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test -race $(go list ./... | grep -v /cmd/)
+      - name: Integration tests (real git, file backend)
+        run: go test -race ./cmd/...
+
+  s3:
+    name: S3 conformance (versitygw)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: kuratest
+      AWS_SECRET_ACCESS_KEY: kuratest-secret-123
+      KURA_TEST_S3_URL: s3://kura-test/ci?region=us-east-1&endpoint=http://127.0.0.1:7070&path_style=true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Start versitygw
+        run: |
+          docker run -d --name s3 -p 127.0.0.1:7070:7070 \
+            -e ROOT_ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e ROOT_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+            versity/versitygw@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316 posix /tmp
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:7070/ && break; sleep 1; done
+          aws --endpoint-url http://127.0.0.1:7070 --region us-east-1 s3 mb s3://kura-test
+      - name: Store conformance, including the put-if-absent race
+        run: go test -race -run TestConformance -v ./internal/store/s3/
+      - name: kura probe
+        run: |
+          go build -o kura ./cmd/kura
+          KURA_KEYSTORE_DIR="$RUNNER_TEMP/ks" ./kura probe "s3://kura-test/probe?region=us-east-1&endpoint=http://127.0.0.1:7070&path_style=true"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./...
+      - name: go.mod is tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Static linux build
+        run: make linux
+      - name: govulncheck
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          repo-checkout: false
