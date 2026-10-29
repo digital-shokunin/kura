@@ -1,6 +1,6 @@
 # Security policy
 
-kura is young and has not been independently audited. Reports are welcome, including design-level ones.
+kura is young and has not been independently audited. Reports are welcome, including design-level ones. Results of automated audits are in [docs/audits](docs/audits/).
 
 ## Reporting a vulnerability
 
